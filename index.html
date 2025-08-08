@@ -1,0 +1,251 @@
+<!--
+README: This single-file index.html is GitHub Pages ready. Place this file as "index.html" in the root of your repo
+alongside your real "pumps.csv" (sample content is below). After pushing, enable GitHub Pages (main branch, root).
+
+Security note: The API key below is placed in the file for immediate testing. After you publish, restrict the key in
+Google Cloud Console to your GitHub Pages domain (e.g. https://yourusername.github.io/*).
+-->
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Petrol Pump Locator (GitHub Pages)</title>
+  <style>
+    :root{--control-bg:#ffffff;--control-shadow:0 2px 8px rgba(15,23,42,0.06)}
+    body{margin:0;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial;color:#111}
+    #controls{position:relative;z-index:5;padding:12px;background:var(--control-bg);box-shadow:var(--control-shadow);display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+    input[type=text], input[type=number], button{padding:8px 10px;border:1px solid #ddd;border-radius:6px;font-size:14px}
+    button.primary{background:#0b74de;color:#fff;border:none}
+    #map{height:calc(100vh - 64px);width:100%}
+    .legend{position:absolute;right:12px;top:72px;background:#fff;padding:10px;border-radius:8px;border:1px solid #eee;box-shadow:0 6px 18px rgba(0,0,0,0.06);z-index:6}
+    .legend .row{display:flex;align-items:center;gap:8px;margin:6px 0}
+    .dot{width:14px;height:14px;border-radius:50%}
+    .dot.green{background:#22c55e}
+    .dot.red{background:#ef4444}
+    @media (max-width:640px){#controls{padding:10px;gap:6px}input[type=text]{width:100%}}
+  </style>
+</head>
+<body>
+  <div id="controls">
+    <input id="cityInput" type="text" placeholder="Search by city (press Enter)" style="min-width:220px">
+    <button id="btnCity" class="primary">Search City</button>
+
+    <input id="startInput" type="text" placeholder="Route start (address or place)" style="min-width:220px">
+    <input id="endInput" type="text" placeholder="Route end (address or place)" style="min-width:220px">
+    <input id="bufferKm" type="number" value="3" min="0.5" max="20" step="0.5" title="Buffer in km">
+    <button id="btnRoute" class="primary">Search Route</button>
+
+    <button id="btnAll">Show All Pumps</button>
+  </div>
+
+  <div id="map"></div>
+
+  <div class="legend">
+    <div class="row"><span class="dot green"></span> Lowest Diesel price (current results)</div>
+    <div class="row"><span class="dot red"></span> Other pumps</div>
+  </div>
+
+  <script>
+    // ====== CONFIG (uses your provided API key) ======
+    const GOOGLE_MAPS_API_KEY = "AIzaSyB3v-OqI83pLDVoWzbeYhlK-T8JGfJGOcU"; // replace if needed
+    const PUMPS_CSV = 'pumps.csv'; // file must sit beside index.html in the repo root
+
+    // ====== App state ======
+    let map, directionsService, directionsRenderer, pumps = [], markers = [], routePolyline = null;
+    let infoWindow;
+
+    // Load external libs: PapaParse (for CSV parsing) is loaded below via CDN inlined script tag.
+  </script>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+
+  <script>
+    function initMap() {
+      map = new google.maps.Map(document.getElementById('map'), {
+        center: { lat: 19.0760, lng: 72.8777 },
+        zoom: 6,
+        mapTypeControl: false
+      });
+
+      directionsService = new google.maps.DirectionsService();
+      directionsRenderer = new google.maps.DirectionsRenderer({ suppressMarkers: true });
+      directionsRenderer.setMap(map);
+
+      infoWindow = new google.maps.InfoWindow();
+
+      // UI wiring
+      document.getElementById('btnCity').addEventListener('click', onCitySearch);
+      document.getElementById('btnRoute').addEventListener('click', onRouteSearch);
+      document.getElementById('btnAll').addEventListener('click', () => { renderMarkers(pumps); fitMapToMarkers(pumps); directionsRenderer.set('directions', null); clearRoute(); });
+      document.getElementById('cityInput').addEventListener('keypress', (e) => { if (e.key === 'Enter') onCitySearch(); });
+
+      // Load CSV from same directory
+      loadPumpsCSV();
+    }
+
+    function loadPumpsCSV(){
+      fetch(PUMPS_CSV).then(r => r.text()).then(txt => {
+        const parsed = Papa.parse(txt, { header: true, skipEmptyLines: true }).data;
+        pumps = parsed.map(r => ({
+          name: (r['Name'] || r['name'] || '').trim(),
+          city: (r['City'] || r['city'] || '').trim(),
+          lat: parseFloat(r['Latitude'] || r['latitude'] || r['Lat'] || r['lat']),
+          lng: parseFloat(r['Longitude'] || r['longitude'] || r['Long'] || r['lng']),
+          price: parseFloat((r['Diesel price'] || r['Diesel Price'] || r['price'] || r['Price'] || '').toString().replace(/[^0-9.\-]/g, ''))
+        })).filter(p => p.name && isFinite(p.lat) && isFinite(p.lng));
+
+        // Render all pumps by default
+        renderMarkers(pumps);
+        fitMapToMarkers(pumps);
+      }).catch(err => {
+        alert('Could not load pumps.csv — make sure the file is in the same folder and named pumps.csv');
+        console.error(err);
+      });
+    }
+
+    // Clear & render markers
+    function clearMarkers(){ markers.forEach(m => m.setMap(null)); markers = []; }
+
+    function renderMarkers(list){
+      clearMarkers();
+      if (!list || list.length === 0) return;
+
+      // find minimum price among valid numbers
+      const prices = list.map(p => p.price).filter(v => isFinite(v));
+      const minPrice = prices.length ? Math.min(...prices) : null;
+
+      for (const p of list){
+        const isCheapest = minPrice !== null && isFinite(p.price) && p.price === minPrice;
+        const marker = new google.maps.Marker({
+          position: { lat: p.lat, lng: p.lng },
+          map,
+          title: `${p.name} - ₹${isFinite(p.price) ? p.price.toFixed(2) : 'N/A'}`,
+          icon: isCheapest ? 'http://maps.google.com/mapfiles/ms/icons/green-dot.png' : 'http://maps.google.com/mapfiles/ms/icons/red-dot.png'
+        });
+
+        marker.addListener('click', () => {
+          infoWindow.setContent(`<div style=\"min-width:220px\">` +
+            `<strong>${escapeHtml(p.name)}</strong><br>` +
+            (p.city ? `City: ${escapeHtml(p.city)}<br>` : '') +
+            (isFinite(p.price) ? `Diesel: ₹${p.price.toFixed(2)}<br>` : '') +
+            `Lat: ${p.lat.toFixed(5)}, Lng: ${p.lng.toFixed(5)}` +
+            `</div>`);
+          infoWindow.open({ anchor: marker, map });
+        });
+
+        markers.push(marker);
+      }
+    }
+
+    function fitMapToMarkers(list){
+      if (!list || list.length === 0) return;
+      const bounds = new google.maps.LatLngBounds();
+      list.forEach(p => bounds.extend({ lat: p.lat, lng: p.lng }));
+      map.fitBounds(bounds, 60);
+    }
+
+    // City search
+    function onCitySearch(){
+      const q = (document.getElementById('cityInput').value || '').trim().toLowerCase();
+      if (!q) { alert('Enter a city name'); return; }
+      const filtered = pumps.filter(p => (p.city || '').toLowerCase().includes(q));
+      if (!filtered.length) { alert('No pumps found for \"' + q + '\"'); return; }
+      renderMarkers(filtered);
+      fitMapToMarkers(filtered);
+      directionsRenderer.set('directions', null);
+      clearRoute();
+    }
+
+    // Route search
+    function onRouteSearch(){
+      const start = (document.getElementById('startInput').value || '').trim();
+      const end = (document.getElementById('endInput').value || '').trim();
+      const bufferKm = parseFloat(document.getElementById('bufferKm').value) || 3;
+
+      if (!start || !end) { alert('Enter both start and end addresses'); return; }
+
+      directionsService.route({ origin: start, destination: end, travelMode: 'DRIVING' }, (resp, status) => {
+        if (status !== 'OK') { alert('Could not compute route: ' + status); return; }
+        directionsRenderer.setDirections(resp);
+
+        // Clear previous route polyline
+        clearRoute();
+
+        const route = resp.routes[0];
+        const path = route.overview_path; // array of LatLng
+
+        // Draw polyline for better visibility
+        routePolyline = new google.maps.Polyline({ path, strokeColor: '#0284c7', strokeWeight: 6, strokeOpacity: 0.7, map });
+
+        // Filter pumps within buffer distance of the route
+        const bufferMeters = Math.max(100, Math.min(50000, Math.round(bufferKm * 1000)));
+        const nearby = pumps.filter(p => distanceToRouteMeters(new google.maps.LatLng(p.lat, p.lng), path) <= bufferMeters);
+
+        if (!nearby.length) { alert('No pumps found along this route within ' + bufferKm + ' km'); renderMarkers([]); return; }
+
+        renderMarkers(nearby);
+        // Fit map to include route and markers
+        fitMapToRouteAndMarkers(path, nearby);
+      });
+    }
+
+    function clearRoute(){ if (routePolyline) { routePolyline.setMap(null); routePolyline = null; } }
+
+    // Fit map to include both route path and pump markers
+    function fitMapToRouteAndMarkers(path, pumpList){
+      const bounds = new google.maps.LatLngBounds();
+      path.forEach(pt => bounds.extend(pt));
+      pumpList.forEach(p => bounds.extend({ lat: p.lat, lng: p.lng }));
+      map.fitBounds(bounds, 80);
+    }
+
+    // Compute point-to-polyline distance (meters)
+    function distanceToRouteMeters(point, path){
+      let min = Infinity;
+      for (let i = 0; i < path.length - 1; i++){
+        const d = distancePointToSegmentMeters(point, path[i], path[i+1]);
+        if (d < min) min = d;
+      }
+      return min;
+    }
+
+    function distancePointToSegmentMeters(p, a, b){
+      const ap = google.maps.geometry.spherical.computeDistanceBetween(a, p);
+      const bp = google.maps.geometry.spherical.computeDistanceBetween(b, p);
+      const ab = google.maps.geometry.spherical.computeDistanceBetween(a, b);
+      if (ab === 0) return ap;
+
+      // Projection method using headings
+      const headingAB = google.maps.geometry.spherical.computeHeading(a, b);
+      const headingAP = google.maps.geometry.spherical.computeHeading(a, p);
+      const proj = Math.cos((headingAP - headingAB) * Math.PI / 180) * ap;
+
+      if (proj <= 0) return ap;
+      if (proj >= ab) return bp;
+
+      // Pythagoras
+      return Math.sqrt(Math.max(0, ap*ap - proj*proj));
+    }
+
+    function escapeHtml(s){ return String(s||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]); }
+
+    // Expose initMap
+    window.initMap = initMap;
+  </script>
+
+  <!-- Load Maps JS with geometry library and callback to initMap -->
+  <script async defer src="https://maps.googleapis.com/maps/api/js?key=AIzaSyB3v-OqI83pLDVoWzbeYhlK-T8JGfJGOcU&libraries=geometry,places&callback=initMap"></script>
+
+  <!-- Sample pumps.csv content (place this file pumps.csv in same folder) -->
+  <!--
+  Name,City,Latitude,Longitude,Diesel price
+  A. R. DOSHI,RASHIN,18.43524,74.922858,91.26
+  ADARSH AUTOMOBILES,PUNE,18.562112,73.924628,90.35
+  ALFA SERVICE STATION, NAIGAON,NAIGAON,18.488631,74.085941,90.24
+  AMIT SERVICE CENTRE,BHOR,18.143793,73.853754,90.78
+  ANANT OIL AGENCIES,RAHURI,19.388868,74.64786,90.88
+  -->
+</body>
+</html>
